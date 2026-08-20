@@ -1,0 +1,55 @@
+# =============================================================================
+# Sync Upstream for EndDream/nodewarden
+# 上游: https://github.com/shuaiplus/nodewarden
+# 作用: 定时把上游 main 分支的更新合并进本 fork，保持同步
+#
+# 部署方式（二选一）:
+#   A. 把本文件放到仓库的 .github/workflows/ 目录下并 commit/push
+#   B. 用 gh 命令创建:  gh workflow create --repo EndDream/nodewarden ...
+#
+# ⚠️ 重要: fork 仓库默认【禁用 GitHub Actions】
+#   首次推送后，请到 仓库 Settings → Actions → General → 选 "Allow all actions"
+#   否则定时任务不会运行。
+#
+# 两种同步策略（选其一）:
+#   1) MERGE（默认，推荐）: 保留你 fork 里自己的 commit，上游更新作为 merge commit 合入。
+#      若同文件冲突会导致本 workflow 失败 → 需手动解决一次。
+#   2) FORCE（纯镜像）: 把下面 push 那行改成 `git push origin main --force`，
+#      会完全覆盖你 fork 的所有内容，等同上游的镜像副本（你的自有改动会丢失）。
+# =============================================================================
+
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '17 3 * * *'      # 每天 UTC 03:17 触发（避开整点高峰）
+  workflow_dispatch: {}        # 允许在 Actions 页面手动点 "Run workflow"
+
+permissions:
+  contents: write              # 用默认 GITHUB_TOKEN 即可，无需额外 PAT
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream & fetch
+        run: |
+          git remote add upstream https://github.com/shuaiplus/nodewarden.git
+          git fetch upstream --tags
+
+      - name: Merge upstream/main
+        run: |
+          # MERGE 策略：保留本地改动；想纯镜像就改成 --force 推送
+          git merge upstream/main --no-edit
+          git push origin main
