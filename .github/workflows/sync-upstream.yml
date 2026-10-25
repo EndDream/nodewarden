@@ -1,55 +1,104 @@
 # =============================================================================
 # Sync Upstream for EndDream/nodewarden
 # 上游: https://github.com/shuaiplus/nodewarden
-# 作用: 定时把上游 main 分支的更新合并进本 fork，保持同步
 #
-# 部署方式（二选一）:
-#   A. 把本文件放到仓库的 .github/workflows/ 目录下并 commit/push
-#   B. 用 gh 命令创建:  gh workflow create --repo EndDream/nodewarden ...
+# 为什么之前一直失败（务必先读）:
+#   GITHUB_TOKEN 永远无权创建或修改 .github/workflows/ 下的文件。上游一旦
+#   改动工作流，合并后再 push 会被 GitHub 直接拒绝：
+#     refusing to allow a GitHub App to create or update workflow
+#     `.github/workflows/xxx.yml` without `workflows` permission
+#   所以本 workflow 在提交前把 .github/workflows/ 恢复成本 fork 的版本，
+#   只搬运代码与配置。
 #
-# ⚠️ 重要: fork 仓库默认【禁用 GitHub Actions】
-#   首次推送后，请到 仓库 Settings → Actions → General → 选 "Allow all actions"
-#   否则定时任务不会运行。
+#   代价：上游对 .github/workflows/ 下文件的安全改进不会自动到达，需要人工
+#   搬运一次。下方「可选升级」可拿回自动同步。
 #
-# 两种同步策略（选其一）:
-#   1) MERGE（默认，推荐）: 保留你 fork 里自己的 commit，上游更新作为 merge commit 合入。
-#      若同文件冲突会导致本 workflow 失败 → 需手动解决一次。
-#   2) FORCE（纯镜像）: 把下面 push 那行改成 `git push origin main --force`，
-#      会完全覆盖你 fork 的所有内容，等同上游的镜像副本（你的自有改动会丢失）。
+# 可选升级（连上游工作流一起同步，4 步）:
+#   1) 建 fine-grained PAT，权限 Contents: Read and write + Workflows: Read
+#      and write，存为「环境」secret（不是仓库 secret）：
+#      Settings → Environments → New environment: sync-upstream
+#      → Add secret，名称 SYNC_PAT
+#   2) 给 job 加一行 environment: sync-upstream
+#      （zizmor 的 secrets-outside-env 要求 secret 绑定环境）
+#   3) checkout 步骤加 with: token: ${{ secrets.SYNC_PAT }}
+#   4) 删掉 "Keep fork workflow files" 这一步
 # =============================================================================
 
 name: Sync Upstream
 
 on:
   schedule:
-    - cron: '17 3 * * *'      # 每天 UTC 03:17 触发（避开整点高峰）
-  workflow_dispatch: {}        # 允许在 Actions 页面手动点 "Run workflow"
+    - cron: '17 3 * * *'      # 每天 UTC 03:17（避开整点高峰）
+  workflow_dispatch:
 
-permissions:
-  contents: write              # 用默认 GITHUB_TOKEN 即可，无需额外 PAT
+# 工作流级不授予任何权限，权限在 job 级按需声明
+# （zizmor/excessive-permissions：工作流级 write 会被判为 overly broad）
+permissions: {}
+
+# 防止定时任务与手动触发同时在跑，互相把对方的 push 顶掉
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 仅本 job 需要：向本仓库 main 推送合并提交
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream & fetch
+      - name: Add upstream and fetch
         run: |
-          git remote add upstream https://github.com/shuaiplus/nodewarden.git
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/shuaiplus/nodewarden.git
+          else
+            git remote add upstream https://github.com/shuaiplus/nodewarden.git
+          fi
           git fetch upstream --tags
 
-      - name: Merge upstream/main
+      - name: Check if update is needed
+        id: check
         run: |
-          # MERGE 策略：保留本地改动；想纯镜像就改成 --force 推送
-          git merge upstream/main --no-edit
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "上游没有新提交，本次跳过。"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream/main
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          if ! git merge --no-commit --no-ff upstream/main; then
+            git merge --abort || true
+            echo "::error::与上游存在冲突，本次已中止且未推送，请人工解决后重跑。"
+            exit 1
+          fi
+
+      - name: Keep fork workflow files
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          # 让索引里的 .github/workflows/ 完全等于 fork 自己（origin/main）的版本：
+          # 先把整个目录移出索引，再从 origin/main 取回。这样上游对这些文件的
+          # 修改、新增、删除都会被丢弃；worktree 中残留的未跟踪文件不会进入提交，
+          # 因此 push 不会再触发 GitHub 的 workflows 权限限制。
+          git rm -r -q --cached .github/workflows
+          git checkout origin/main -- .github/workflows
+          git status --short
+
+      - name: Commit and push
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          # --allow-empty: 上游只改了工作流时索引可能与 HEAD 相同，仍需要一个
+          # 合并提交把上游标记为已同步，避免第二天重复失败。
+          git commit --allow-empty -m "chore: sync upstream/main"
           git push origin main
