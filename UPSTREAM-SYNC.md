@@ -59,7 +59,9 @@
 2. Settings → Secrets and variables → Actions → New repository secret，名称 `SYNC_PAT`
 3. Actions → Sync Upstream → Run workflow，验证日志里出现「使用 SYNC_PAT」
 
-之后可选：把 `Build & Test` 设为 `main` 的必需检查。**只在 `pat` 模式下做**——`github-token` 模式的 bot PR 不触发 CI，设成必需检查会让这类 PR 永远等一个不会来的检查。
+当前状态（2026-11-16）：已配置 `SYNC_PAT`，`main` 的必需检查是 `Build & Test`（`strict=false`，管理员可绕过）。
+
+**反向操作顺序**：如果 secret 被删除或 PAT 过期，工作流会自动退回 `github-token` 模式，bot PR 将不再触发 CI。此时**先移除必需检查**，否则 bot PR 会永远等一个不会来的检查。`github-token` 模式下不要设必需检查。
 
 （不建 PAT 也能长期跑，代价是上游对工作流的安全改进要人工搬运，每次同步会在 PR/issue 里列清单。）
 
