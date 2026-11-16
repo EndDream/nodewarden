@@ -2,70 +2,61 @@
 # Sync Upstream for EndDream/nodewarden
 # 上游: https://github.com/shuaiplus/nodewarden
 #
-# 为什么之前一直失败（务必先读）:
-#   GITHUB_TOKEN 永远无权创建或修改 .github/workflows/ 下的文件。上游一旦
-#   改动工作流，合并后再 push 会被 GitHub 直接拒绝：
-#     refusing to allow a GitHub App to create or update workflow
-#     `.github/workflows/xxx.yml` without `workflows` permission
-#   所以本 workflow 在提交前把 .github/workflows/ 恢复成本 fork 的版本，
-#   只搬运代码与配置。
+# 设计原则（A 方案）:
+#   1. 只读上游：upstream 仅用于 fetch，永不向它推送。
+#   2. 机器人不写 main：main 受分支保护，同步结果只能以 PR 形式进入。
+#   3. 门禁前置：GITHUB_TOKEN 创建的 PR 不会触发新的 workflow（GitHub 防递归），
+#      所以 ci-gate 在开 PR 之前就在合并后的工作树上跑，失败则根本不开 PR。
+#   4. 冲突不猜测：merge 失败立即 abort，开 issue 留证，不做任何"自动取一边"。
+#   5. 工作流文件单独处理：GITHUB_TOKEN 无权修改 .github/workflows/，
+#      因此提交前恢复为 fork 版本，并把上游改动清单写进 PR / issue，避免静默丢失。
 #
-#   代价：上游对 .github/workflows/ 下文件的安全改进不会自动到达，需要人工
-#   搬运一次。下方「可选升级」可拿回自动同步。
-#
-# 可选升级（连上游工作流一起同步，4 步）:
-#   1) 建 fine-grained PAT，权限 Contents: Read and write + Workflows: Read
-#      and write，存为「环境」secret（不是仓库 secret）：
-#      Settings → Environments → New environment: sync-upstream
-#      → Add secret，名称 SYNC_PAT
-#   2) 给 job 加一行 environment: sync-upstream
-#      （zizmor 的 secrets-outside-env 要求 secret 绑定环境）
-#   3) checkout 步骤加 with: token: ${{ secrets.SYNC_PAT }}
-#   4) 删掉 "Keep fork workflow files" 这一步
+# 限制与升级路径:
+#   - 该模式不会自动同步上游对 .github/workflows/ 的改动。
+#   - 需要连工作流一起同步时：建 fine-grained PAT（Contents + Workflows 读写），
+#     存入 environment: sync-upstream 的 SYNC_PAT，checkout 用它并删掉
+#     "Keep fork workflow files" 一步。届时 PR 也会自动触发 CI。
 # =============================================================================
 
 name: Sync Upstream
 
 on:
   schedule:
-    - cron: '17 3 * * *'      # 每天 UTC 03:17（避开整点高峰）
+    - cron: '17 3 * * *'      # 每天 UTC 03:17
   workflow_dispatch:
 
-# 工作流级不授予任何权限，权限在 job 级按需声明
-# （zizmor/excessive-permissions：工作流级 write 会被判为 overly broad）
 permissions: {}
 
-# 防止定时任务与手动触发同时在跑，互相把对方的 push 顶掉
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/shuaiplus/nodewarden.git
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write        # 仅本 job 需要：向本仓库 main 推送合并提交
+      contents: write        # 推送 sync/* 临时分支
+      pull-requests: write   # 创建同步 PR
+      issues: write          # 冲突或仅工作流变更时留证
+
     steps:
-      - name: Checkout fork
+      - name: Checkout main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Configure git identity
+      - name: Configure git and fetch upstream
         run: |
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Add upstream and fetch
-        run: |
-          if git remote get-url upstream >/dev/null 2>&1; then
-            git remote set-url upstream https://github.com/shuaiplus/nodewarden.git
-          else
-            git remote add upstream https://github.com/shuaiplus/nodewarden.git
-          fi
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
           git fetch upstream --tags
 
-      - name: Check if update is needed
+      - name: Check for updates
         id: check
         run: |
           if git merge-base --is-ancestor upstream/main HEAD; then
@@ -73,32 +64,165 @@ jobs:
             echo "needed=false" >> "$GITHUB_OUTPUT"
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "branch=sync/upstream-$(date -u +%F)" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Merge upstream/main
+      - name: Collect upstream changes
         if: steps.check.outputs.needed == 'true'
         run: |
-          if ! git merge --no-commit --no-ff upstream/main; then
+          git log --oneline --no-decorate origin/main..upstream/main > /tmp/commits.txt
+          git diff --name-only origin/main upstream/main -- .github/workflows > /tmp/wf-changed.txt || true
+          echo "上游提交 $(wc -l < /tmp/commits.txt) 条，工作流改动 $(wc -l < /tmp/wf-changed.txt) 个文件。"
+
+      - name: Update mirror branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          # mirror/upstream 是上游 main 的精确副本，只允许本 job 写。
+          # 上游若改写历史，这里用 --force 让镜像仍然一致。
+          git push --force origin "upstream/main:refs/heads/mirror/upstream"
+
+      - name: Merge upstream without committing
+        id: merge
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          if git merge --no-commit --no-ff upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
             git merge --abort || true
-            echo "::error::与上游存在冲突，本次已中止且未推送，请人工解决后重跑。"
-            exit 1
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Report merge conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "自动同步在合并 \`upstream/main\` 时发生冲突（$(date -u +%F)），已中止，**未推送任何分支**。"
+            echo
+            echo "冲突文件："
+            echo '```'
+            cat /tmp/conflicts.txt
+            echo '```'
+            echo
+            echo "本地处理："
+            echo '```bash'
+            echo 'git fetch upstream'
+            echo "git checkout -b ${{ steps.check.outputs.branch }} origin/main"
+            echo 'git merge --no-ff upstream/main'
+            echo '```'
+            echo
+            echo "解决后推分支、开 PR，并确认 \`scripts/ci-gate.sh\` 全绿。"
+          } > /tmp/issue-body.md
+          existing=$(gh issue list --state open --search '"[sync] 上游合并冲突" in:title' --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/issue-body.md
+          else
+            gh issue create --title "[sync] 上游合并冲突" --body-file /tmp/issue-body.md
+          fi
+          exit 1
 
       - name: Keep fork workflow files
-        if: steps.check.outputs.needed == 'true'
+        if: steps.merge.outputs.conflict == 'false'
         run: |
-          # 让索引里的 .github/workflows/ 完全等于 fork 自己（origin/main）的版本：
-          # 先把整个目录移出索引，再从 origin/main 取回。这样上游对这些文件的
-          # 修改、新增、删除都会被丢弃；worktree 中残留的未跟踪文件不会进入提交，
-          # 因此 push 不会再触发 GitHub 的 workflows 权限限制。
+          # GITHUB_TOKEN 无权新增/修改 .github/workflows/ 下文件，push 会被拒。
+          # 这里把整个目录还原为 fork（origin/main）的版本，上游改动改由 PR / issue 告知。
           git rm -r -q --cached .github/workflows
           git checkout origin/main -- .github/workflows
-          git status --short
 
-      - name: Commit and push
-        if: steps.check.outputs.needed == 'true'
+      - name: Check effective diff
+        id: diff
+        if: steps.merge.outputs.conflict == 'false'
         run: |
-          # --allow-empty: 上游只改了工作流时索引可能与 HEAD 相同，仍需要一个
-          # 合并提交把上游标记为已同步，避免第二天重复失败。
-          git commit --allow-empty -m "chore: sync upstream/main"
-          git push origin main
+          if git diff --quiet HEAD; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "合并结果与 main 无差异（上游改动全部落在工作流目录）。"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report workflow-only update
+        if: steps.diff.outputs.empty == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git merge --abort || true
+          if [ -s /tmp/wf-changed.txt ]; then
+            {
+              echo "上游本次只改动了工作流文件（$(date -u +%F)），这些改动**没有**进入 fork，已跳过本次同步。"
+              echo
+              echo '```'
+              cat /tmp/wf-changed.txt
+              echo '```'
+              echo
+              echo "请人工评估是否搬运（涉及权限、触发器、供应链安全的部分优先），搬运后手动调用本 workflow 重跑，即可把上游标记为已同步。"
+            } > /tmp/issue-body.md
+            existing=$(gh issue list --state open --search '"[sync] 上游工作流更新待搬运" in:title' --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body-file /tmp/issue-body.md
+            else
+              gh issue create --title "[sync] 上游工作流更新待搬运" --body-file /tmp/issue-body.md
+            fi
+          fi
+
+      - name: Commit merge
+        if: steps.diff.outputs.empty == 'false'
+        run: |
+          git commit --no-edit
+          git log --oneline -1
+
+      - name: Setup Node.js
+        if: steps.diff.outputs.empty == 'false'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Run gate
+        if: steps.diff.outputs.empty == 'false'
+        run: bash scripts/ci-gate.sh
+
+      - name: Push sync branch
+        if: steps.diff.outputs.empty == 'false'
+        run: |
+          BRANCH="${{ steps.check.outputs.branch }}"
+          git checkout -B "$BRANCH"
+          git fetch origin "$BRANCH" || true
+          git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Open pull request
+        if: steps.diff.outputs.empty == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.check.outputs.branch }}"
+          existing=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "PR #$existing 已存在，本次只更新了分支内容。"
+            exit 0
+          fi
+          {
+            echo "上游 \`main\` 的自动同步，门禁已在本 job 内通过。"
+            echo
+            echo "### 上游提交"
+            echo '```'
+            cat /tmp/commits.txt
+            echo '```'
+            if [ -s /tmp/wf-changed.txt ]; then
+              echo
+              echo "### 注意：未同步的工作流改动"
+              echo "以下文件的上游改动已被 fork 版本覆盖（GITHUB_TOKEN 无 workflows 权限），需人工评估："
+              echo '```'
+              cat /tmp/wf-changed.txt
+              echo '```'
+            fi
+            echo
+            echo "### 说明"
+            echo "- 门禁：\`bash scripts/ci-gate.sh\`，在本 job 内执行"
+            echo "- 本 PR 由 \`GITHUB_TOKEN\` 创建，不会再次触发 CI（GitHub 防递归），结果以本 job 日志为准"
+            echo "- 冲突由人工解决，不做自动取舍"
+          } > /tmp/pr-body.md
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore(sync): 上游更新 $(date -u +%F)" \
+            --body-file /tmp/pr-body.md
