@@ -3,18 +3,26 @@ name: "CodeQL Advanced"
 on:
   push:
     branches:
-      - "**"
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '23 5 * * 1'
 
-permissions:
-  contents: read
-  actions: read
-  security-events: write
-  packages: read
+# 工作流级不授予任何权限，权限在 job 级按需声明
+# （zizmor/excessive-permissions：工作流级 write 会被判为 overly broad）
+permissions: {}
 
 jobs:
   analyze:
     name: CodeQL Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      security-events: write   # 上传 SARIF 到 code scanning
 
     strategy:
       fail-fast: false
