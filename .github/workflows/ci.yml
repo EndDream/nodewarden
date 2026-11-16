@@ -1,13 +1,14 @@
 name: CI
 
-# 此前仓库里 9 个 test 脚本与 build 没有任何 CI 在执行，PR 处于零门禁状态。
-# 本 workflow 把它们接上：构建 + i18n 校验 + 全部单元/兼容性测试。
+# 门禁实现集中在 scripts/ci-gate.sh：本 workflow 与上游同步 workflow 共用同一套
+# 检查，避免"机器人 PR 走一套、人工 PR 走另一套"的漂移。
 
 on:
   push:
     branches:
       - main
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -33,19 +34,5 @@ jobs:
           node-version-file: .node-version
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build web app
-        run: npm run build
-
-      - name: Validate i18n resources
-        run: npm run i18n:validate
-
-      - name: Run unit and compatibility tests
-        run: |
-          npm run test:config-compatibility
-          npm run test:vault-compatibility
-          npm run test:web-crypto
-          npm run test:notifications-security
-          npm run test:webauthn-connectors
+      - name: Run gate
+        run: bash scripts/ci-gate.sh
