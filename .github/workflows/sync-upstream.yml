@@ -183,7 +183,7 @@ jobs:
               echo '```'
               echo
               echo "两条路可选："
-              echo '1. 配置 `SYNC_PAT`（见 UPSTREAM-SYNC.md 第 4 节），此后自动同步；'
+              echo '1. 配置 SYNC_PAT（见 UPSTREAM-SYNC.md 第 4 节），此后自动同步；'
               echo '2. 人工搬运这批改动，再手动重跑本 workflow，即可把上游标记为已同步。'
             } > /tmp/issue-body.md
             existing=$(gh issue list --state open --search '"[sync] 上游工作流更新待搬运" in:title' --json number --jq '.[0].number // empty')
