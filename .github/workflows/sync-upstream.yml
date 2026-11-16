@@ -74,6 +74,13 @@ jobs:
           git diff --name-only origin/main upstream/main -- .github/workflows > /tmp/wf-changed.txt || true
           echo "上游提交 $(wc -l < /tmp/commits.txt) 条，工作流改动 $(wc -l < /tmp/wf-changed.txt) 个文件。"
 
+      - name: Update mirror branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          # mirror/upstream 是上游 main 的精确副本，只允许本 job 写。
+          # 上游若改写历史，这里用 --force 让镜像仍然一致。
+          git push --force origin "upstream/main:refs/heads/mirror/upstream"
+
       - name: Merge upstream without committing
         id: merge
         if: steps.check.outputs.needed == 'true'
