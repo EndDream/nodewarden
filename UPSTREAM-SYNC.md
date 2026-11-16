@@ -25,7 +25,7 @@
 2. 刷新 `mirror/upstream` 为上游 `main` 的精确副本
 3. 从 `main` 建 `sync/upstream-<日期>`，`git merge --no-ff upstream/main`
 4. 冲突 → `git merge --abort` + 开 issue 留证 + 失败退出，**不自动取舍**
-5. 合并成功 → 把 `.github/workflows/` 还原为 fork 版本（`GITHUB_TOKEN` 无权改工作流）
+5. 合并成功 → 未配置 `SYNC_PAT` 时把 `.github/workflows/` 还原为 fork 版本（内置 token 无权改工作流）；配置后跳过此步，工作流随上游一起同步
 6. 跑 `scripts/ci-gate.sh`（与 CI 同一套检查），失败则不开 PR
 7. 推送分支 → 开 PR，正文附上游提交清单与「被覆盖的工作流改动」清单
 
@@ -44,21 +44,25 @@
 
 高风险文件（上游 `CONTRIBUTING.md` 点名）：`src/services/storage-schema.ts`、`migrations/0001_init.sql`、`src/services/storage.ts`、`src/services/backup-archive.ts`、`src/services/backup-import.ts`、`src/handlers/ciphers.ts`、`src/handlers/sync.ts`、`src/services/storage-cipher-repo.ts`。
 
-## 4. 已知限制：工作流不会自动同步
+## 4. 工作流同步：双模式，`SYNC_PAT` 是可选项
 
-`GITHUB_TOKEN` 无权创建或修改 `.github/workflows/` 下的文件，所以同步时会整体还原为 fork 版本。后果：
+内置 `GITHUB_TOKEN` **永远**拿不到 `workflows` 权限（GitHub 不允许给 App token 这个 scope，改仓库设置也没用），所以推送含 `.github/workflows/` 改动的提交会被拒。workflow 因此内置两种模式，自动探测：
 
-- 上游对工作流的安全改进**不会自动到达**
-- 每次同步在 PR 正文里列出被覆盖的文件；若上游只改工作流，会单独开 issue 提醒，且不会重复开（按标题去重）
+| 模式 | 触发条件 | 工作流改动 | bot PR 的 CI |
+|---|---|---|---|
+| `github-token` | 未配置 `SYNC_PAT` | 还原为 fork 版本，改动写进 PR 正文；若上游只改工作流则开 issue 提醒（按标题去重） | **不触发**（GitHub 防递归），结果只看 job 日志 |
+| `pat` | 已配置 `SYNC_PAT` | 随上游一起同步 | 自动触发 |
 
-升级路径（需要人工建 PAT，机器做不到）：
+升级到 `pat` 模式（一次性，**不需要改任何代码**）：
 
-1. 建 fine-grained PAT：Contents 读写 + Workflows 读写，仅限本仓库
-2. 存为 **environment** secret `SYNC_PAT`（Settings → Environments → `sync-upstream`）
-3. job 加 `environment: sync-upstream`，checkout 用 `token: ${{ secrets.SYNC_PAT }}`
-4. 删除 `Keep fork workflow files` 一步
+1. 建 fine-grained PAT：`Contents` RW + `Workflows` RW + `Pull requests` RW + `Issues` RW，**仅限 `EndDream/nodewarden`**
+2. Settings → Secrets and variables → Actions → New repository secret，名称 `SYNC_PAT`
+3. Actions → Sync Upstream → Run workflow，验证日志里出现「使用 SYNC_PAT」
 
-升级后 PR 也会自动触发 CI（`GITHUB_TOKEN` 创建的 PR 不会，这是 GitHub 防递归机制），届时应把 `Build & Test` 设为必需检查。
+之后可选：把 `Build & Test` 设为 `main` 的必需检查。**只在 `pat` 模式下做**——`github-token` 模式的 bot PR 不触发 CI，设成必需检查会让这类 PR 永远等一个不会来的检查。
+
+（不建 PAT 也能长期跑，代价是上游对工作流的安全改进要人工搬运，每次同步会在 PR/issue 里列清单。）
+
 
 ## 5. 双向同步（回推上游）
 

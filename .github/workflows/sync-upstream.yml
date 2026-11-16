@@ -8,14 +8,24 @@
 #   3. 门禁前置：GITHUB_TOKEN 创建的 PR 不会触发新的 workflow（GitHub 防递归），
 #      所以 ci-gate 在开 PR 之前就在合并后的工作树上跑，失败则根本不开 PR。
 #   4. 冲突不猜测：merge 失败立即 abort，开 issue 留证，不做任何"自动取一边"。
-#   5. 工作流文件单独处理：GITHUB_TOKEN 无权修改 .github/workflows/，
-#      因此提交前恢复为 fork 版本，并把上游改动清单写进 PR / issue，避免静默丢失。
+#   5. 双模式：有 SYNC_PAT 时全量同步（含 .github/workflows/）；没有时退化为
+#      "工作流目录还原为 fork 版本 + 开 issue 告知"，不会静默丢东西。
 #
-# 限制与升级路径:
-#   - 该模式不会自动同步上游对 .github/workflows/ 的改动。
-#   - 需要连工作流一起同步时：建 fine-grained PAT（Contents + Workflows 读写），
-#     存入 environment: sync-upstream 的 SYNC_PAT，checkout 用它并删掉
-#     "Keep fork workflow files" 一步。届时 PR 也会自动触发 CI。
+# 两种模式:
+#   mode=pat          checkout / push / gh 全部用 secrets.SYNC_PAT
+#                     → 上游工作流改动可自动同步；bot PR 也会自动触发 CI
+#   mode=github-token 只用内置 GITHUB_TOKEN
+#                     → 内置 token 永远没有 workflows 权限，工作流目录必须
+#                       还原为 fork 版本，上游改动写进 PR 正文 / issue
+#
+# 升级到 pat 模式（一次性，约 2 分钟，无需改代码）:
+#   1. 建 fine-grained PAT：Contents RW + Workflows RW + Pull requests RW
+#      + Issues RW，仅限 EndDream/nodewarden
+#   2. Settings → Secrets and variables → Actions → New repository secret
+#      名称 SYNC_PAT
+#   3. 手动跑一次本 workflow 验证
+#   之后再考虑把 "Build & Test" 设为 main 的必需检查（pat 模式 bot PR 会触发 CI；
+#   github-token 模式下 bot PR 不触发 CI，设了会导致 PR 永远等不到检查）。
 # =============================================================================
 
 name: Sync Upstream
@@ -43,11 +53,27 @@ jobs:
       issues: write          # 冲突或仅工作流变更时留证
 
     steps:
+      - name: Detect sync token
+        id: token
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          # 只判断是否存在，绝不回显值
+          if [ -n "$SYNC_PAT" ]; then
+            echo "mode=pat" >> "$GITHUB_OUTPUT"
+            echo "使用 SYNC_PAT：工作流文件随上游一起同步。"
+          else
+            echo "mode=github-token" >> "$GITHUB_OUTPUT"
+            echo "未配置 SYNC_PAT：仅同步非工作流改动（见 UPSTREAM-SYNC.md 第 4 节）。"
+          fi
+
       - name: Checkout main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: main
           fetch-depth: 0
+          # 没有 SYNC_PAT 时回落到内置 token，行为与旧版一致
+          token: ${{ secrets.SYNC_PAT || github.token }}
 
       - name: Configure git and fetch upstream
         run: |
@@ -96,7 +122,7 @@ jobs:
       - name: Report merge conflict
         if: steps.merge.outputs.conflict == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
         run: |
           {
             echo "自动同步在合并 \`upstream/main\` 时发生冲突（$(date -u +%F)），已中止，**未推送任何分支**。"
@@ -124,16 +150,16 @@ jobs:
           exit 1
 
       - name: Keep fork workflow files
-        if: steps.merge.outputs.conflict == 'false'
+        # 只有 github-token 模式才需要：内置 token 无权新增/修改工作流文件，
+        # 推送会被 "refusing to allow a GitHub App to create or update workflow" 拒。
+        if: steps.merge.outputs.conflict == 'false' && steps.token.outputs.mode == 'github-token'
         run: |
-          # GITHUB_TOKEN 无权新增/修改 .github/workflows/ 下文件，push 会被拒。
-          # 这里把整个目录还原为 fork（origin/main）的版本，上游改动改由 PR / issue 告知。
           git rm -r -q --cached .github/workflows
           git checkout origin/main -- .github/workflows
 
       - name: Check effective diff
         id: diff
-        if: steps.merge.outputs.conflict == 'false'
+        if: steps.merge.outputs.conflict == 'false' && steps.token.outputs.mode == 'github-token'
         run: |
           if git diff --quiet HEAD; then
             echo "empty=true" >> "$GITHUB_OUTPUT"
@@ -143,7 +169,7 @@ jobs:
           fi
 
       - name: Report workflow-only update
-        if: steps.diff.outputs.empty == 'true'
+        if: steps.token.outputs.mode == 'github-token' && steps.diff.outputs.empty == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -156,7 +182,9 @@ jobs:
               cat /tmp/wf-changed.txt
               echo '```'
               echo
-              echo "请人工评估是否搬运（涉及权限、触发器、供应链安全的部分优先），搬运后手动调用本 workflow 重跑，即可把上游标记为已同步。"
+              echo "两条路可选："
+              echo '1. 配置 `SYNC_PAT`（见 UPSTREAM-SYNC.md 第 4 节），此后自动同步；'
+              echo '2. 人工搬运这批改动，再手动重跑本 workflow，即可把上游标记为已同步。'
             } > /tmp/issue-body.md
             existing=$(gh issue list --state open --search '"[sync] 上游工作流更新待搬运" in:title' --json number --jq '.[0].number // empty')
             if [ -n "$existing" ]; then
@@ -167,24 +195,24 @@ jobs:
           fi
 
       - name: Commit merge
-        if: steps.diff.outputs.empty == 'false'
+        if: steps.merge.outputs.conflict == 'false' && steps.diff.outputs.empty != 'true'
         run: |
           git commit --no-edit
           git log --oneline -1
 
       - name: Setup Node.js
-        if: steps.diff.outputs.empty == 'false'
+        if: steps.merge.outputs.conflict == 'false' && steps.diff.outputs.empty != 'true'
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version-file: .node-version
           cache: npm
 
       - name: Run gate
-        if: steps.diff.outputs.empty == 'false'
+        if: steps.merge.outputs.conflict == 'false' && steps.diff.outputs.empty != 'true'
         run: bash scripts/ci-gate.sh
 
       - name: Push sync branch
-        if: steps.diff.outputs.empty == 'false'
+        if: steps.merge.outputs.conflict == 'false' && steps.diff.outputs.empty != 'true'
         run: |
           BRANCH="${{ steps.check.outputs.branch }}"
           git checkout -B "$BRANCH"
@@ -192,9 +220,10 @@ jobs:
           git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
 
       - name: Open pull request
-        if: steps.diff.outputs.empty == 'false'
+        if: steps.merge.outputs.conflict == 'false' && steps.diff.outputs.empty != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          MODE: ${{ steps.token.outputs.mode }}
         run: |
           BRANCH="${{ steps.check.outputs.branch }}"
           existing=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
@@ -209,18 +238,23 @@ jobs:
             echo '```'
             cat /tmp/commits.txt
             echo '```'
-            if [ -s /tmp/wf-changed.txt ]; then
+            if [ "$MODE" = "github-token" ] && [ -s /tmp/wf-changed.txt ]; then
               echo
               echo "### 注意：未同步的工作流改动"
-              echo "以下文件的上游改动已被 fork 版本覆盖（GITHUB_TOKEN 无 workflows 权限），需人工评估："
               echo '```'
               cat /tmp/wf-changed.txt
               echo '```'
+              echo "以上文件的上游改动已被 fork 版本覆盖（未配置 \`SYNC_PAT\`，内置 token 无 workflows 权限），需人工评估。"
             fi
             echo
             echo "### 说明"
+            echo "- 令牌模式：\`$MODE\`"
             echo "- 门禁：\`bash scripts/ci-gate.sh\`，在本 job 内执行"
-            echo "- 本 PR 由 \`GITHUB_TOKEN\` 创建，不会再次触发 CI（GitHub 防递归），结果以本 job 日志为准"
+            if [ "$MODE" = "github-token" ]; then
+              echo "- 本 PR 由内置 \`GITHUB_TOKEN\` 创建，不会再次触发 CI（GitHub 防递归），结果以本 job 日志为准"
+            else
+              echo "- 本 PR 由 \`SYNC_PAT\` 创建，会自动触发 CI，可与 job 日志互相印证"
+            fi
             echo "- 冲突由人工解决，不做自动取舍"
           } > /tmp/pr-body.md
           gh pr create --base main --head "$BRANCH" \
