@@ -77,7 +77,7 @@
 
 ## 6. 发布与回滚
 
-- 发布对齐上游 release tag（当前 `v1.8.1`），不追每次 commit
+- 发布对齐上游 release tag（当前 `v1.8.2`），不追每次 commit
 - 每次同步合并前打 tag：`pre-sync-YYYY-MM-DD`，出问题 `git revert -m 1 <merge>` 或用 tag 回滚
 - 禁止对 `main` 使用 `--force`；同步分支允许 `--force-with-lease`（bot 专用）
 - 许可证：LGPL-3.0。分发派生版本必须同许可证、保留版权声明、提供对应源码
